@@ -2,6 +2,7 @@
 // Beer brew monitoring of temperature
 //
 // ------------------------
+// DS18B20 connected to D4
 // 128x64 OLED pinout:
 // Data to I2C SDA (GPIO 4) purple(blue)
 // Clk to I2C SCL (GPIO 5) grey(green)
@@ -11,6 +12,11 @@
 // buzz D5
 // button D6 and TX
 // ------------------------
+// RTC DS3132
+// Data to I2C SDA (GPIO 4) purple(blue)
+// Clk to I2C SCL (GPIO 5) grey(green)
+// GND goes to ground
+// Vin goes to 3.3V
 
 
 #include <ArduinoJson.h>
@@ -23,6 +29,12 @@
 #include <SSD1306.h>
 #include <SSD1306Wire.h>
 #include "IFTTTWebhook.h"
+#include <RTClib.h>
+
+
+//********************************
+//#define SERIAL_DEBUG // Uncomment this to dissable serial debugging
+//********************************
 
 // Create a display object
 //0x3d for the Adafruit 1.3" OLED, 0x3C being the usual address of the OLED
@@ -34,9 +46,6 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature DS18B20(&oneWire);
 
 
-//********************************
-#define SERIAL_DEBUG // Uncomment this to dissable serial debugging
-//********************************
 
 // set delay period
 int period = 30 * 1000;
@@ -61,28 +70,42 @@ byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing pack
 #define GMT 3  //timezone
 uint8_t hour, minute, second, day, month, year, weekday;
 uint8_t monthDays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-String Time1;
+String Time1; //concated time string
 unsigned long secsSince1900;
+
+// ------ RTC config
+RTC_DS3231 rtc;
+char t[32];
+int startTime;
+int timer;
+boolean timer_state = false;
+
 
 // ------- ifttt config --------
 //https://maker.ifttt.com/trigger/MY_IFTTT_EVENT_NAME/with/key/MY_IFTTT_API_KEY
 #define IFTTT_API_KEY "MY_IFTTT_API_KEY"
 #define IFTTT_EVENT_NAME "MY_IFTTT_EVENT_NAME"
-unsigned long last_time_message;
-unsigned long current_time;
-int period_message = 300; // delay beetwen sending message
+int last_time_message = 0;
+//int current_time;
+int period_message = 5; // delay beetwen sending message
 
 //------- temp bounds --------
+float pause_time;
 float t1;
 float default_temp = 25;
+int default_pause_time = 2;
 boolean default_temp_state = false;
 float t_first_pause = 55;
+int first_pause_time = 25;
 boolean t_first_pause_state = false;
 float t_second_pause = 65;
+int second_pause_time = 30;
 boolean t_second_pause_state = false;
 float t_third_pause = 72;
+int third_pause_time = 30;
 boolean t_third_pause_state = false;
 float t_mash_out = 78;
+int mash_out_pause_time = 10;
 boolean t_mash_out_state = false;
 float t_boil = 98;
 boolean t_boil_state = false;
@@ -108,7 +131,7 @@ char *append_str(char *here, char *s) {
 }
 
 void setup () {
-// config for debugging
+  // config for debugging
 #ifdef SERIAL_DEBUG
   delay(1000);
   Serial.begin(115200);
@@ -145,7 +168,7 @@ void setup () {
   while (WiFi.status() != WL_CONNECTED) {
     debug(".");
     delay(500);
-    display.drawString(0, 10, "Connecting to Wifi...");
+    display.drawString(0, 10, "Connecting to Wifi....");
     display.display();
   }
   debugln("");
@@ -154,7 +177,7 @@ void setup () {
   IPAddress ip = WiFi.localIP();
   ipAddress = ip.toString();
   debugln(ipAddress);
-  display.drawString(0, 20, "Connected.");
+  display.drawString(95, 10, ".done");
   display.drawString(0, 30, ipAddress);
   display.display();
   debugln("Starting UDP");
@@ -167,8 +190,21 @@ void setup () {
   pinMode(p_button, INPUT_PULLUP);
   attachInterrupt ( digitalPinToInterrupt (p_button), buttonInterrupt, FALLING);
 
-  // get time from NTP server
+  // get time from NTP server and sync RTC in case is got
   gettime();
+  if (Time1 != NULL) {
+    // sync time
+    debugln("Sync time from NTP server");
+    rtc.begin();
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+  }
+  if (rtc.lostPower()) {
+    debugln("RTC lost power, lets set the time!");
+    // following line sets the RTC to the date & time this sketch was compiled
+   display.drawString(0, 50, "RTC lost power!!!");
+     display.display();
+  }
+  timeNow();
 
   // start messages
   float temp_0 = getTemperature();
@@ -184,94 +220,104 @@ void setup () {
   display.drawString(0, 40, msg_test);
   display.display();
   delay(5000);
-  //  debugln("closing connections");
-  //  debugln("Sleep Mode");
-  //  ESP.deepSleep(sleepTimeS * 2000000);
-
 
 }
 
 
 void sendIFTTTrequest_http(String msg) {
-  // create and convert to char messages (ssid, ip, temp)
-  String message1 = "SSID: ";
-  message1.concat(ssid);
-  String message2 = "IP: ";
-  message2.concat(ipAddress);
-  String message3 = msg;
-  char cmsg1[message1.length() + 1]; char cmsg2[message2.length() + 1]; char cmsg3[message3.length() + 1];
-  message1.toCharArray(cmsg1, message1.length() + 1);
-  message2.toCharArray(cmsg2, message2.length() + 1);
-  message3.toCharArray(cmsg3, message3.length() + 1);
+  if (hour * 60 + minute - last_time_message > period_message) {
+    // create and convert to char messages (ssid, ip, temp)
+    String message1 = "SSID: ";
+    message1.concat(ssid);
+    String message2 = "IP: ";
+    message2.concat(ipAddress);
+    String message3 = msg;
+    char cmsg1[message1.length() + 1]; char cmsg2[message2.length() + 1]; char cmsg3[message3.length() + 1];
+    message1.toCharArray(cmsg1, message1.length() + 1);
+    message2.toCharArray(cmsg2, message2.length() + 1);
+    message3.toCharArray(cmsg3, message3.length() + 1);
 
-  debugln("IFTTT values:");
-  debugln(cmsg1);
-  debugln(cmsg2);
-  debugln(cmsg3);
-  debugln("-------------");
-  // connect to the Maker event server
-  client.connect("maker.ifttt.com", 80);
+    debugln("IFTTT values:");
+    debugln(cmsg1);
+    debugln(cmsg2);
+    debugln(cmsg3);
+    debugln("-------------");
+    // connect to the Maker event server
+    client.connect("maker.ifttt.com", 80);
 
-  // construct the POST request
-  char post_rqst[257];    // hand-calculated to be big enough
+    // construct the POST request
+    char post_rqst[257];    // hand-calculated to be big enough
 
-  char *p = post_rqst;
-  p = append_str(p, "POST /trigger/");
-  p = append_str(p, IFTTT_EVENT_NAME);
-  p = append_str(p, "/with/key/");
-  p = append_str(p, IFTTT_API_KEY);
-  p = append_str(p, " HTTP/1.1\r\n");
-  p = append_str(p, "Host: maker.ifttt.com\r\n");
-  p = append_str(p, "Content-Type: application/json\r\n");
-  p = append_str(p, "Content-Length: ");
+    char *p = post_rqst;
+    p = append_str(p, "POST /trigger/");
+    p = append_str(p, IFTTT_EVENT_NAME);
+    p = append_str(p, "/with/key/");
+    p = append_str(p, IFTTT_API_KEY);
+    p = append_str(p, " HTTP/1.1\r\n");
+    p = append_str(p, "Host: maker.ifttt.com\r\n");
+    p = append_str(p, "Content-Type: application/json\r\n");
+    p = append_str(p, "Content-Length: ");
 
-  // we need to remember where the content length will go, which is:
-  char *content_length_here = p;
+    // we need to remember where the content length will go, which is:
+    char *content_length_here = p;
 
-  // it's always two digits, so reserve space for them (the NN)
-  p = append_str(p, "NN\r\n");
+    // it's always two digits, so reserve space for them (the NN)
+    p = append_str(p, "NN\r\n");
 
-  // end of headers
-  p = append_str(p, "\r\n");
+    // end of headers
+    p = append_str(p, "\r\n");
 
-  // construct the JSON; remember where we started so we will know len
-  char *json_start = p;
+    // construct the JSON; remember where we started so we will know len
+    char *json_start = p;
 
-  // As described - this example reports a pin, uptime, and "via#tuinbot"
-  p = append_str(p, "{\"value1\":\"");
-  p = append_str(p, cmsg1);
-  p = append_str(p, "\",\"value2\":\"");
-  p = append_str(p, cmsg2);
-  p = append_str(p, "\",\"value3\":\"");
-  p = append_str(p, cmsg3);
-  p = append_str(p, "\"}");
+    // As described - this example reports a pin, uptime, and "via#tuinbot"
+    p = append_str(p, "{\"value1\":\"");
+    p = append_str(p, cmsg1);
+    p = append_str(p, "\",\"value2\":\"");
+    p = append_str(p, cmsg2);
+    p = append_str(p, "\",\"value3\":\"");
+    p = append_str(p, cmsg3);
+    p = append_str(p, "\"}");
 
-  // go back and fill in the JSON length
-  // we just know this is at most 2 digits (and need to fill in both)
-  int i = strlen(json_start);
-  content_length_here[0] = '0' + (i / 10);
-  content_length_here[1] = '0' + (i % 10);
-  last_time_message = secsSince1900;
-  // finally we are ready to send the POST to the server!
-  client.print(post_rqst);
-  client.stop();
-  debug (post_rqst);
-  IFTTTWebhook wh(IFTTT_API_KEY, IFTTT_EVENT_NAME);
-  //wh.trigger();
-  //wh.trigger("1");
-  //wh.trigger("1", "2");
-  //wh.trigger("1", "2", "3");
+    // go back and fill in the JSON length
+    // we just know this is at most 2 digits (and need to fill in both)
+    int i = strlen(json_start);
+    content_length_here[0] = '0' + (i / 10);
+    content_length_here[1] = '0' + (i % 10);
+    // finally we are ready to send the POST to the server!
+    client.print(post_rqst);
+    client.stop();
+    debugln (post_rqst);
+    IFTTTWebhook wh(IFTTT_API_KEY, IFTTT_EVENT_NAME);
+    wh.trigger();
+    wh.trigger("1");
+    wh.trigger("1", "2");
+    wh.trigger("1", "2", "3");
+    debugln("Message was send!!!");
+    last_time_message = hour * 60 + minute;
+  }
 }
 
 float getTemperature() {
   float result;
   DS18B20.requestTemperatures();
   result = DS18B20.getTempCByIndex(0);
-  // debug ("result: ");
-  // debugln(String(result));
   result = round(result * 10) / 10.0;
   return result;
 }
+
+
+void timeNow() {
+
+  DateTime now = rtc.now();
+  sprintf(t, "%02d.%02d.%02d %02d:%02d:%02d ",   now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second());
+  debug(F("RTC Date/Time: "));
+  debugln(t);
+  Time1 = t;
+  hour = now.hour();
+  minute = now.minute();
+}
+
 
 // send an NTP request to the time server at the given address
 unsigned long sendNTPpacket(IPAddress& address) {
@@ -299,7 +345,6 @@ unsigned long sendNTPpacket(IPAddress& address) {
 String Time_to_String() {
   String Tm, wd;
   int k, n;
-
   k = day / 10;
   n = day % 10;
   Tm = String(k) + String(n) + ".";
@@ -308,7 +353,6 @@ String Time_to_String() {
   Tm = Tm + String(k) + String(n) + ".";
   // short version of  yyear - 2000
   k = 1900 + year - 2000;
-  // Tm = Tm + String(k) + " " + wd + " ";
   Tm = Tm + String(k) + " ";
   k = hour / 10;
   n = hour % 10;
@@ -321,7 +365,6 @@ String Time_to_String() {
   n = second % 10;
   Tm = Tm + ":" + String(k) + String(n);
   //
-  //Tm = "10 05 2018 th";
   return (Tm);
 }
 
@@ -356,8 +399,8 @@ void Unix_to_GMT(unsigned long epoch) {
   }
   month++;       // jan is month 1
   day = epoch + 1; // day of month
-
 }
+
 void gettime() {
   debug("Get time: ");
   //get a random server from the pool
@@ -415,8 +458,6 @@ void gettime() {
     Time1 = Time_to_String();
     debugln(Time1);
     // Serial.println(Time_to_String());
-
-
   }
   // wait ten seconds before asking for the time again
   //delay(10000);
@@ -443,9 +484,47 @@ void buttonInterrupt() {
   buttonState = 1;
 }
 
+void startTimer() {
+  int timeNow;
+  int timeLeft;
+  String disp_msg;
+  if (timer_state) {
+    timeNow = hour * 60 + minute;
+    timer = timeNow - startTime;
+    timeLeft = pause_time - timer;
+    debug("startTime: ");
+    debugln(String(startTime));
+    debug("timer: ");
+    debugln(String(timer));
+    debug("time left: ");
+    debugln(String(timeLeft));
+    disp_msg += "time left: ";
+    disp_msg += String(timeLeft);
+    if (timeLeft <= 0) {
+      if (buttonState) {
+        debugln("Timer OFF");
+        timer_state = false;
+      } else {
+        debugln("Timer stop");
+        debugln("!!! ALARM !!!");
+        beep(80);
+        light(80);
+        disp_msg += " !!! ALARM !!!";
+
+      }
+    }
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.setFont(ArialMT_Plain_10);
+    display.drawStringMaxWidth(64, 50, 128, disp_msg);
+    display.display();
+  }
+}
+
 void serial_log() {
   debug("btn_state: ");
   debugln(String(buttonState));
+  debug("timer_state: ");
+  debugln(String(timer_state));
   debug("default_temp_state: ");
   debugln(String(default_temp_state));
   debug("t_first_pause_state: ");
@@ -460,6 +539,12 @@ void serial_log() {
   debugln(String(t_boil_state));
   debug("button_counter: ");
   debugln(String(buttonPushCounter));
+  debug("pouse_time: ");
+  debugln(String(pause_time));
+  debug("last_time_message: ");
+  debugln(String(last_time_message));
+  debugln("Time to send message: NOW!");
+
 }
 
 void beep(unsigned char delayms) {
@@ -471,6 +556,10 @@ void beep(unsigned char delayms) {
   delay(delayms);
 }
 void light (unsigned char delayms) {
+  //digitalWrite(p_light, HIGH);
+  //delay(delayms);
+  // digitalWrite(p_light, LOW);
+  //digitalWrite (LED_BUILTIN, HIGH);
   digitalWrite (LED_BUILTIN, LOW);
   delay(delayms);
 
@@ -485,73 +574,65 @@ void light (unsigned char delayms) {
 void loop() {
   display.clear();
 
-  if (millis() - last_time > period) {
-    last_time = millis();
-    gettime();      //wait approx. [period] ms
-  }
-
+  //if (millis() - last_time > period) {
+  //    last_time = millis();
+  //    gettime();      //wait approx. [period] ms
+  //  }
+  debugln("");
+  debugln("-- Running test ESP --");
+  timeNow(); //get time from RTC
   String msg_test;
-  String disp_msg = "t:";
-  float temp_0 = getTemperature();
+  String disp_msg = "t1:";
+  float temp_0 = getTemperature();//get temperature from DS18B20
   if (Time1 != NULL) {
-    debugln("-- Running test ESP --");
     msg_test = String("BREW: ");
     msg_test += String(Time1);
-    msg_test += " t:";
+    msg_test += " t1:";
     msg_test += temp_0;
     //  sendIFTTTrequest_http(msg_test);
+    // set temperature and time to display
     disp_msg += temp_0;
+    debugln(disp_msg);
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.setFont(ArialMT_Plain_24);
-    display.drawStringMaxWidth(64, 5, 128, disp_msg);
+    display.drawStringMaxWidth(64, 1, 128, disp_msg);
     display.setFont(ArialMT_Plain_10);
-    display.drawStringMaxWidth(64, 30, 128, Time1);
+    display.drawStringMaxWidth(64, 24, 128, Time1);
+    display.drawLine (5, 38, 123, 38);
     display.display();
   }
-  // call sensors.requestTemperatures() to issue a global temperature
-  // request to all devices on the bus
-  //  sensors.requestTemperatures();
-  display.drawLine (5, 44, 123, 43);
-  // Read temperature as Celsius
-  //  t1 = sensors.getTempCByIndex(0);
-  t1 = temp_0;
 
-  //  lcd.setCursor(0, 0); //  Set cursor 1 line 0 symbol
-  //  lcd.print("Current"); // Output text
-  //  lcd.setCursor(0, 1); // Set cursor 2 line 0 symbol
-  //  lcd.print(sensors.getTempCByIndex(0), 1);
+  t1 = temp_0;
 
   // First pause
   if ((t1 >= t_first_pause - 1) && (t1 <= t_first_pause + 1)) {
     disp_msg = "First Pause : " + String(t_first_pause).substring(0, 2);
-    if ((buttonState) || (t_first_pause_state)) {
-      //  lcd.setCursor(8, 0); //  Set cursor 1 line 8 symbol
-      //  lcd.print("Frst off"); // Output text
-      disp_msg += " OFF";
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
-      display.display();
-      t_first_pause_state = true;
-    }
-    if (!t_first_pause_state) {
-      beep(80);
-      //lcd.setCursor(8, 0); // Set cursor 1 line 8 symbol
-      //lcd.print("First P "); // Output text
-      //lcd.setCursor(9, 1); // // Set cursor 2 line 9 symbol
-      //lcd.print(t_first_pause, 1); // Output temperature
-      display.setTextAlignment(TEXT_ALIGN_CENTER);
-      display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
-      display.display();
-      if (secsSince1900 - last_time_message > period_message) {
-        msg_test += " First Pause";
-        debug("last_time_message:");
-        debugln(String(last_time_message));
-        debugln("Time to send message:");
-        sendIFTTTrequest_http(msg_test);
-        debugln(msg_test);
+    if ((buttonState) || (t_first_pause_state)) {  // first press of button or pause state confirmed
+      if ((!timer_state) && (buttonState)) { //check if already timer run
+        timer_state = true;   //set flag to run timer
+        startTime = hour * 60 + minute;  //def start time when button was pressed
+        pause_time = first_pause_time; //set pause time for timer
+        debug("Set start time: ");
+        debugln(String(startTime));
       }
+      disp_msg += " OFF ";
+      debugln(disp_msg);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.setFont(ArialMT_Plain_10);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
+      display.display();
+
+      t_first_pause_state = true; //flag pause confirmed
+    }
+    if (!t_first_pause_state) {  // pause state not confirmed
+      beep(80);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.setFont(ArialMT_Plain_10);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
+      display.display();
+      msg_test += " First Pause";
+      sendIFTTTrequest_http(msg_test);
+      debugln(msg_test);
       light(80);
     }
   }
@@ -560,10 +641,18 @@ void loop() {
   if ((t1 >= t_second_pause - 1) && (t1 <= t_second_pause + 1)) {
     disp_msg = "Second Pause : " + String(t_second_pause).substring(0, 2);
     if ((buttonState) || (t_second_pause_state)) {
-      disp_msg += " OFF";
+      if ((!timer_state) && (buttonState)) { //check if already timer run
+        timer_state = true;   //set flag to run timer
+        startTime = hour * 60 + minute;  //def start time when button was pressed
+        pause_time = second_pause_time; //set pause time for timer
+        debug("Set start time: ");
+        debugln(String(startTime));
+      }
+      disp_msg += " OFF ";
+      debugln(disp_msg);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
       t_second_pause_state = true;
     }
@@ -571,28 +660,30 @@ void loop() {
       beep(80);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
-      if (secsSince1900 - last_time_message > period_message) {
-        msg_test += " Second Pause";
-        debug("last_time_message:");
-        debugln(String(last_time_message));
-        debugln("Time to send message:");
-        sendIFTTTrequest_http(msg_test);
-        debugln(msg_test);
-      }
+      msg_test += " Second Pause";
+      sendIFTTTrequest_http(msg_test);
+      debugln(msg_test);
       light(80);
-
     }
   }
   // Third pause
   if ((t1 >= t_third_pause - 1) && (t1 <= t_third_pause + 1)) {
     disp_msg = "Third Pause : " + String(t_third_pause).substring(0, 2);
     if ((buttonState) || (t_third_pause_state)) {
-      disp_msg += " OFF";
+      if ((!timer_state) && (buttonState)) { //check if already timer run
+        timer_state = true;   //set flag to run timer
+        startTime = hour * 60 + minute;  //def start time when button was pressed
+        pause_time = third_pause_time; //set pause time for timer
+        debug("Set start time: ");
+        debugln(String(startTime));
+      }
+      disp_msg += " OFF ";
+      debugln(disp_msg);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
       t_third_pause_state = true;
     }
@@ -600,28 +691,30 @@ void loop() {
       beep(80);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
-      if (secsSince1900 - last_time_message > period_message) {
-        msg_test += " Third Pause";
-        debug("last_time_message:");
-        debugln(String(last_time_message));
-        debugln("Time to send message:");
-        sendIFTTTrequest_http(msg_test);
-        debugln(msg_test);
-      }
+      msg_test += " Third Pause";
+      sendIFTTTrequest_http(msg_test);
+      debugln(msg_test);
       light(80);
-
     }
   }
   //  Mash out
   if ((t1 >= t_mash_out - 1) && (t1 <= t_mash_out + 1)) {
     disp_msg = "Mashout : " + String(t_mash_out).substring(0, 2);
     if ((buttonState) || (t_mash_out_state)) {
-      disp_msg += " OFF";
+      if ((!timer_state) && (buttonState)) { //check if already timer run
+        timer_state = true;   //set flag to run timer
+        startTime = hour * 60 + minute;  //def start time when button was pressed
+        pause_time = mash_out_pause_time; //set pause time for timer
+        debug("Set start time: ");
+        debugln(String(startTime));
+      }
+      disp_msg += " OFF ";
+      debugln(disp_msg);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
       t_mash_out_state = true;
     }
@@ -630,16 +723,11 @@ void loop() {
       beep(80);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
-      if (secsSince1900 - last_time_message > period_message) {
-        msg_test += " Mashout";
-        debug("last_time_message:");
-        debugln(String(last_time_message));
-        debugln("Time to send message:");
-        sendIFTTTrequest_http(msg_test);
-        debugln(msg_test);
-      }
+      msg_test += " Mashout";
+      sendIFTTTrequest_http(msg_test);
+      debugln(msg_test);
       light(80);
 
     }
@@ -651,7 +739,7 @@ void loop() {
       disp_msg += " OFF";
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
       t_boil_state = true;
     }
@@ -660,66 +748,54 @@ void loop() {
       beep(80);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
-      if (secsSince1900 - last_time_message > period_message) {
-        msg_test += " Boil";
-        debug("last_time_message:");
-        debugln(String(last_time_message));
-        debugln("Time to send message:");
-        sendIFTTTrequest_http(msg_test);
-        debugln(msg_test);
-      }
+      msg_test += " Boil";
+      sendIFTTTrequest_http(msg_test);
+      debugln(msg_test);
       light(80);
     }
   }
 
   //////////////////////////////////////////
-  if ((t1 >= default_temp - 1) && (t1 <= default_temp + 1)) {
+  if ((t1 >= default_temp - 1) && (t1 <= default_temp + 1)) { //def state button pressed
     disp_msg = "Default : " + String(default_temp).substring(0, 2);
-    if ((buttonState) || (default_temp_state)) {
+    if ((buttonState) || (default_temp_state)) { //def state button pressed
+      if ((!timer_state) && (buttonState)) { //check if already timer run
+        timer_state = true;   //set flag to run timer
+        startTime = hour * 60 + minute;  //def start time when button was pressed
+        pause_time = default_pause_time;
+        debug("Set start time: ");
+        debugln(String(startTime));
+      }
       disp_msg += " OFF ";
-      disp_msg += String(hour);
-      disp_msg += ":";
-      disp_msg += String(minute);
+      debugln(disp_msg);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
-      default_temp_state = true;
+
+      default_temp_state = true; //flag for
+
     }
-    if (!default_temp_state) {
+    if (!default_temp_state) {   //def state started with beep but button not pressed
       beep(80);
       display.setTextAlignment(TEXT_ALIGN_CENTER);
       display.setFont(ArialMT_Plain_10);
-      display.drawStringMaxWidth(64, 47, 128, disp_msg);
+      display.drawStringMaxWidth(64, 40, 128, disp_msg);
       display.display();
-      //debugln("def state");
-      //current_time=secsSince1900
-      if (secsSince1900 - last_time_message > period_message) {
-        msg_test += " Default";
-        debug("last_time_message:");
-        debugln(String(last_time_message));
-        debugln("Time to send message:");
-        sendIFTTTrequest_http(msg_test);
-        debugln(msg_test);
-      }
-      /*debug("secsSince1900:");
-        debugln(String(secsSince1900));
-        debug("last_time_message:");
-        debugln(String(last_time_message));*/
+      debugln("def state");
+      msg_test += " Default";
+      sendIFTTTrequest_http(msg_test);
+      debugln(msg_test);
       light(80);
     }
   }
   serial_log();
-  // delay(500);
-  /*  if (digitalRead(p_button)) {
-      debugln("-- button 1 --");   //LED ON
-    } else {
-      debugln("-- button 2 --");;  //LED OFF
-    }
-  */
-  buttonState = 0;
 
-  delay(1000);    //Send a request to update every 10 sec (= 10,000 ms)
+  startTimer();
+  buttonState = 0; //reset button state
+
+  delay(2000);    //Send a request to update every 10 sec (= 10,000 ms)
 }
+
